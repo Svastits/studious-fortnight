@@ -1,4 +1,4 @@
-# Copyright 2023 Aron Svastits
+# Copyright 2023 KUKA Hungaria Kft.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ def launch_setup(context, *args, **kwargs):
     driver_version = LaunchConfiguration("driver_version")
     client_ip = LaunchConfiguration("client_ip")
     client_port = LaunchConfiguration("client_port")
+    mxa_client_port = LaunchConfiguration("mxa_client_port")
     controller_ip = LaunchConfiguration("controller_ip")
     x = LaunchConfiguration("x")
     y = LaunchConfiguration("y")
@@ -45,6 +46,7 @@ def launch_setup(context, *args, **kwargs):
     non_rt_cores = LaunchConfiguration("non_rt_cores")
     rt_core = LaunchConfiguration("rt_core")
     rt_prio = LaunchConfiguration("rt_prio")
+    lock_memory = LaunchConfiguration("lock_memory")
     if ns.perform(context) == "":
         tf_prefix = ""
     else:
@@ -106,6 +108,9 @@ def launch_setup(context, *args, **kwargs):
             "client_port:=",
             client_port,
             " ",
+            "mxa_client_port:=",
+            mxa_client_port,
+            " ",
             "client_ip:=",
             client_ip,
             " ",
@@ -147,8 +152,6 @@ def launch_setup(context, *args, **kwargs):
     # The driver config contains only parameters that can be changed after startup
     driver_config = get_package_share_directory("kuka_rsi_driver") + "/config/driver_config.yaml"
 
-    controller_manager_node = ns.perform(context) + "/controller_manager"
-
     control_node = Node(
         namespace=ns,
         package="kuka_drivers_core",
@@ -161,6 +164,7 @@ def launch_setup(context, *args, **kwargs):
             {
                 "cpu_affinity": int(rt_core.perform(context)),
                 "thread_priority": int(rt_prio.perform(context)),
+                "lock_memory": lock_memory.perform(context) == "true",
                 "hardware_components_initial_state": {
                     "unconfigured": [tf_prefix + robot_model.perform(context)]
                 },
@@ -194,7 +198,7 @@ def launch_setup(context, *args, **kwargs):
         arg_list = [
             controller_names,
             "-c",
-            controller_manager_node,
+            "controller_manager",
             "-n",
             ns,
         ]
@@ -251,6 +255,7 @@ def generate_launch_description():
     launch_arguments.append(DeclareLaunchArgument("namespace", default_value=""))
     launch_arguments.append(DeclareLaunchArgument("client_ip", default_value="0.0.0.0"))
     launch_arguments.append(DeclareLaunchArgument("client_port", default_value="59152"))
+    launch_arguments.append(DeclareLaunchArgument("mxa_client_port", default_value="1337"))
     launch_arguments.append(DeclareLaunchArgument("controller_ip", default_value="0.0.0.0"))
     launch_arguments.append(DeclareLaunchArgument("x", default_value="0"))
     launch_arguments.append(DeclareLaunchArgument("y", default_value="0"))
@@ -300,6 +305,15 @@ def generate_launch_description():
             description=(
                 "Comma-separated CPU core indices for taskset pinning of non-RT threads "
                 "(e.g. '2,3,4'). Leave empty to disable pinning."
+            ),
+        )
+    )
+    launch_arguments.append(
+        DeclareLaunchArgument(
+            "lock_memory",
+            default_value="true",
+            description=(
+                "Whether to lock memory of the control loop with mlockall to avoid paging"
             ),
         )
     )

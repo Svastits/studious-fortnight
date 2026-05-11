@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <sys/mman.h>
+
 #include <memory>
 #include <thread>
 
@@ -71,6 +73,27 @@ int main(int argc, char ** argv)
         }
       }
 
+      bool lock_memory = controller_manager->get_parameter_or<bool>("lock_memory", true);
+      if (lock_memory)
+      {
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) == -1)
+        {
+          RCLCPP_ERROR(controller_manager->get_logger(), "mlockall error: %s", strerror(errno));
+        }
+        else
+        {
+          RCLCPP_INFO(
+            controller_manager->get_logger(),
+            "Memory of control loop locked successfully to disable paging");
+        }
+      }
+      else
+      {
+        RCLCPP_WARN(
+          controller_manager->get_logger(),
+          "Memory locking disabled, consider enabling it for better real-time performance");
+      }
+
       struct sched_param param;
       param.sched_priority = controller_manager->get_parameter_or<int>("thread_priority", 70);
       if (sched_setscheduler(0, SCHED_FIFO, &param) == -1)
@@ -88,14 +111,17 @@ int main(int argc, char ** argv)
           param.sched_priority);
       }
 
-      const rclcpp::Duration dt =
-        rclcpp::Duration::from_seconds(1.0 / controller_manager->get_update_rate());
-      std::chrono::milliseconds dt_ms{1000 / controller_manager->get_update_rate()};
-
       try
       {
         while (rclcpp::ok())
         {
+          // Use a fixed period for interpolation, as the interpolation cycle is also fixed on the
+          // controller side. Calculating the period from the actual time could cause jitter in the
+          // interpolated values
+          // TODO: adjust dt for non-integer update rates, (e.g. 12 ms cycle time for RSI IPO mode)
+          const rclcpp::Duration dt =
+            rclcpp::Duration::from_seconds(1.0 / controller_manager->get_update_rate());
+
           if (is_configured)
           {
             controller_manager->read(controller_manager->now(), dt);
@@ -105,8 +131,15 @@ int main(int argc, char ** argv)
           else
           {
             controller_manager->update(controller_manager->now(), dt);
-            std::this_thread::sleep_for(dt_ms);
+            std::this_thread::sleep_for(dt.to_chrono<std::chrono::nanoseconds>());
           }
+        }
+
+        // Unlock memory after control loop finishes
+        int rc = munlockall();
+        if (rc != 0)
+        {
+          RCLCPP_ERROR(controller_manager->get_logger(), "munlockall error: %s", strerror(errno));
         }
       }
       catch (std::exception & e)

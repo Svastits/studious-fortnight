@@ -15,6 +15,9 @@
 #ifndef KUKA_RSI_DRIVER__ROBOT_MANAGER_NODE_EXTENDED_HPP_
 #define KUKA_RSI_DRIVER__ROBOT_MANAGER_NODE_EXTENDED_HPP_
 
+#include <string>
+#include <vector>
+
 #include "std_msgs/msg/u_int32.hpp"
 #include "std_msgs/msg/u_int8.hpp"
 
@@ -37,7 +40,7 @@ public:
 private:
   void EventSubscriptionCallback(const std_msgs::msg::UInt8::SharedPtr message) override;
 
-  bool OnControlModeChangeRequest(const int control_mode) override;
+  bool OnControlModeChangeRequestAdditionalTasks(const int control_mode) override;
 
   std::condition_variable control_mode_cv_;
   std::mutex control_mode_cv_m_;

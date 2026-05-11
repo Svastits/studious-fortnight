@@ -78,6 +78,22 @@ RobotManagerBase::RobotManagerBase() : kuka_drivers_core::ROS2BaseLCNode("robot_
       use_gpio_ = use_gpio;
       return true;
     });
+
+  set_param_client_ = this->create_client<rcl_interfaces::srv::SetParameters>(
+    "controller_manager/set_parameters", qos.get_rmw_qos_profile(), cbg_);
+
+  // Publisher for sending cycle_time to KssMessageHandler
+  cycle_time_pub_ = this->create_publisher<std_msgs::msg::UInt8>(
+    "kss_message_handler/cycle_time", rclcpp::SystemDefaultsQoS());
+
+  // Use the provided value to initialize the member (prevents unused-parameter warning)
+  this->registerParameter<int>(
+    "cycle_time", 1, kuka_drivers_core::ParameterSetAccessRights{true, true},
+    [this](int cycle_time)
+    {
+      // Set default cycle time (from parameter)
+      return ValidateCycleTime(static_cast<CycleTime>(cycle_time));  // 1 => 4ms, 2 => 12ms
+    });
 }
 
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
@@ -91,7 +107,7 @@ RobotManagerBase::configure_driver(const std::vector<std::string> & controllers_
     return FAILURE;
   }
 
-  // Activate event broadcaster
+  // Activate event broadcaster / configuration controllers
   const bool controller_activation_successful = kuka_drivers_core::changeControllerState(
     change_controller_state_client_, controllers_to_activate, {});
   if (!controller_activation_successful)
@@ -104,6 +120,11 @@ RobotManagerBase::configure_driver(const std::vector<std::string> & controllers_
   is_configured_pub_->on_activate();
   is_configured_msg_.data = true;
   is_configured_pub_->publish(is_configured_msg_);
+
+  std_msgs::msg::UInt8 msg;
+  msg.data = static_cast<uint8_t>(cycle_time_);
+  cycle_time_pub_->publish(msg);
+
   return SUCCESS;
 }
 
@@ -141,6 +162,11 @@ RobotManagerBase::on_activate(const rclcpp_lifecycle::State &)
 {
   const auto logger = get_logger();
   terminate_ = false;
+  if (!ChangeCycleTime(cycle_time_))
+  {
+    RCLCPP_ERROR(logger, "Could not change cycle time");
+    return FAILURE;
+  }
 
   // Activate hardware interface
   const bool hw_state_change_successful = kuka_drivers_core::changeHardwareState(
@@ -268,10 +294,8 @@ bool RobotManagerBase::OnControlModeChangeRequest(const int control_mode)
     return false;
   }
 
-  if (get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE)
+  if (!OnControlModeChangeRequestAdditionalTasks(control_mode))
   {
-    RCLCPP_ERROR(
-      logger, "Changing control mode during active control is not supported by plain RSI driver");
     return false;
   }
 
@@ -280,6 +304,80 @@ bool RobotManagerBase::OnControlModeChangeRequest(const int control_mode)
   RCLCPP_INFO(logger, "Successfully changed control mode to %i", control_mode);
 
   return true;
+}
+
+bool RobotManagerBase::ValidateCycleTime(CycleTime cycle_time)
+{
+  if (this->get_current_state().id() == State::PRIMARY_STATE_ACTIVE)
+  {
+    RCLCPP_ERROR(
+      this->get_logger(),
+      "Tried to change cycle time while driver is active. "
+      "Cycle time can only be changed in inactive state. "
+      "Please deactivate the driver, change cycle time, and activate it again.");
+    return false;
+  }
+
+  if (cycle_time != CycleTime::RSI_4MS && cycle_time != CycleTime::RSI_12MS)
+  {
+    RCLCPP_ERROR(
+      get_logger(), "Invalid cycle time requested: %s. Valid options are %s and %s.",
+      CycleTimeToString(cycle_time), CycleTimeToString(CycleTime::RSI_4MS),
+      CycleTimeToString(CycleTime::RSI_12MS));
+    return false;
+  }
+
+  if (cycle_time_ == cycle_time)
+  {
+    RCLCPP_WARN(
+      get_logger(),
+      "Tried to change cycle time to the one currently used: %s. No change will be made.",
+      CycleTimeToString(cycle_time));
+    return true;
+  }
+
+  std_msgs::msg::UInt8 msg;
+  msg.data = static_cast<uint8_t>(cycle_time);
+
+  RCLCPP_INFO(
+    this->get_logger(), "Publishing cycle_time  %s on kss_message_handler/cycle_time",
+    CycleTimeToString(cycle_time));
+
+  cycle_time_pub_->publish(msg);
+  cycle_time_ = cycle_time;
+  return true;
+}
+
+bool RobotManagerBase::ChangeCycleTime(CycleTime cycle_time)
+{
+  int ms = CycleTimeToInt(cycle_time);
+  int desired_rate_ = 1000 / ms;  // Convert ms to Hz
+  auto request = std::make_shared<rcl_interfaces::srv::SetParameters::Request>();
+  rcl_interfaces::msg::Parameter param;
+  rclcpp::Parameter p("update_rate", desired_rate_);
+  request->parameters.push_back(p.to_parameter_msg());
+  RCLCPP_INFO(this->get_logger(), "Publishing update_rate (%d Hz)", desired_rate_);
+
+  if (auto response = kuka_drivers_core::sendRequest<rcl_interfaces::srv::SetParameters::Response>(
+        set_param_client_, request,
+        5000,  // service timeout
+        5000   // response timeout
+      );
+      !response || response->results.empty() || !response->results[0].successful)
+  {
+    const char * reason = (response && !response->results.empty())
+                            ? response->results[0].reason.c_str()
+                            : "no response";
+
+    RCLCPP_ERROR(this->get_logger(), "Failed to set update_rate parameter: %s", reason);
+    return false;
+  }
+  else
+  {
+    RCLCPP_INFO(
+      this->get_logger(), "Successfully set update_rate parameter to %d Hz", desired_rate_);
+    return true;
+  }
 }
 
 }  // namespace kuka_rsi_driver

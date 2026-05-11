@@ -171,10 +171,13 @@ bool KukaRSIHardwareInterfaceBase::SetupRobot(
   std::unique_ptr<kuka::external::control::EventHandler> event_handler,
   std::unique_ptr<kuka::external::control::kss::IEventHandlerExtension> extension)
 {
-  RCLCPP_INFO(logger_, "Initiating network setup...");
+  RCLCPP_INFO(logger_, "Setting up robot...");
 
-  config.dof = info_.joints.size();
-  RCLCPP_INFO(logger_, "Configured GPIO commands:");
+  ConfigureJoints(config);
+
+  RCLCPP_INFO(
+    logger_, info_.gpios[0].command_interfaces.empty() ? "No GPIO command interfaces configured"
+                                                       : "Configured GPIO commands:");
   for (const auto & gpio_command : info_.gpios[0].command_interfaces)
   {
     RCLCPP_INFO(
@@ -182,11 +185,13 @@ bool KukaRSIHardwareInterfaceBase::SetupRobot(
       gpio_command.name.c_str(), gpio_command.data_type.c_str(), gpio_command.initial_value.c_str(),
       gpio_command.min.c_str(), gpio_command.max.c_str());
 
-    // TODO (Komaromi): Add size and parameters
+    // TODO(Komaromi): Add size and parameters
     config.gpio_command_configs.emplace_back(ParseGPIOConfig(gpio_command));
   }
 
-  RCLCPP_INFO(logger_, "Configured GPIO states:");
+  RCLCPP_INFO(
+    logger_, info_.gpios[0].state_interfaces.empty() ? "No GPIO state interfaces configured"
+                                                     : "Configured GPIO states:");
   for (const auto & gpio_state : info_.gpios[0].state_interfaces)
   {
     RCLCPP_INFO(
@@ -194,7 +199,7 @@ bool KukaRSIHardwareInterfaceBase::SetupRobot(
       gpio_state.name.c_str(), gpio_state.data_type.c_str(), gpio_state.initial_value.c_str(),
       gpio_state.min.c_str(), gpio_state.max.c_str());
 
-    // TODO (Komaromi): Add size, and parameters
+    // TODO(Komaromi): Add size, and parameters
     config.gpio_state_configs.emplace_back(ParseGPIOConfig(gpio_state));
   }
 
@@ -224,7 +229,7 @@ bool KukaRSIHardwareInterfaceBase::SetupRobot(
     return false;
   }
 
-  RCLCPP_INFO(logger_, "Network setup successful!");
+  RCLCPP_INFO(logger_, "Robot setup successful!");
 
   return true;
 }
@@ -236,6 +241,31 @@ void KukaRSIHardwareInterfaceBase::Read(const int64_t request_timeout)
   msg_received_ = motion_state_status.return_code == kuka::external::control::ReturnCode::OK;
   if (msg_received_)
   {
+    // record timestamp immediately after the motion state is received
+    auto now = std::chrono::steady_clock::now();
+
+    // measure interval since previous packet if available
+    if (last_msg_received_time_ != std::chrono::steady_clock::time_point{})
+    {
+      auto interval = now - last_msg_received_time_;
+      auto interval_ms =
+        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(interval);
+      // determine expected cycle time enum
+      double dt_ms = (prev_cycle_time_ == RsiCycleTime::RSI_12MS) ? 12.0 : 4.0;  // default to 4ms
+      double low_thresh = dt_ms - 0.5;
+      double high_thresh = dt_ms + 0.5;
+      if (interval_ms.count() < low_thresh || interval_ms.count() > high_thresh)
+      {
+        RCLCPP_WARN(
+          logger_,
+          "Unexpected RSI state interval: %.3f ms (expected %.3f±0.5 ms), change in interpolation "
+          "count %lu",
+          interval_ms.count(), dt_ms, robot_ptr_->getIpoc() - last_ipoc_);
+      }
+    }
+    // update stored time for both interval and control-latency calculations
+    last_msg_received_time_ = now;
+
     const auto & req_message = robot_ptr_->GetLastMotionState();
     const auto & positions = req_message.GetMeasuredPositions();
     const auto & gpio_values = req_message.GetGPIOValues();
@@ -256,6 +286,17 @@ void KukaRSIHardwareInterfaceBase::Read(const int64_t request_timeout)
           gpio_values.at(i)->GetGPIOConfig()->GetName().c_str());
       }
     }
+
+    if (robot_ptr_->getDelay() != 0)
+    {
+      packet_loss_count_++;
+      RCLCPP_WARN(
+        logger_,
+        "Packet loss registered, number of lost packets: %lu, continuous packet losses: %lu",
+        packet_loss_count_, robot_ptr_->getDelay());
+    }
+
+    last_ipoc_ = robot_ptr_->getIpoc();
   }
   else
   {
@@ -302,6 +343,7 @@ bool KukaRSIHardwareInterfaceBase::CheckJointInterfaces(
 
   return true;
 }
+
 void KukaRSIHardwareInterfaceBase::CopyGPIOStatesToCommands()
 {
   for (size_t i = 0; i < gpio_states_to_commands_map_.size(); i++)
@@ -319,7 +361,7 @@ kuka::external::control::kss::GPIOConfiguration KukaRSIHardwareInterfaceBase::Pa
   kuka::external::control::kss::GPIOConfiguration gpio_config;
   gpio_config.name = info.name;
   gpio_config.enable_limits = true;
-  // TODO (komaromi): This might not work from Kilted kaiju onward the get_optional function in the
+  // TODO(komaromi): This might not work from Kilted kaiju onward the get_optional function in the
   // handle since it is only accepting double and bool
   if (info.data_type == "BOOL" || info.data_type == "bool")
   {
@@ -353,7 +395,7 @@ kuka::external::control::kss::GPIOConfiguration KukaRSIHardwareInterfaceBase::Pa
   }
   else
   {
-    // TODO (Komaromi): Should this be set to 0?
+    // TODO(Komaromi): Should this be set to 0?
     gpio_config.initial_value = 0.0;  // If initial_value is empty, set to 0.0
   }
   if (!info.min.empty())
@@ -403,6 +445,8 @@ kuka::external::control::kss::GPIOConfiguration KukaRSIHardwareInterfaceBase::Pa
 
 CallbackReturn KukaRSIHardwareInterfaceBase::extended_activation(const rclcpp_lifecycle::State &)
 {
+  ResetDiagnostics();
+
   if (status_manager_.IsEmergencyStopActive())
   {
     RCLCPP_ERROR(logger_, "Emergency stop is active. Cannot activate hardware interface.");
@@ -518,6 +562,20 @@ void KukaRSIHardwareInterfaceBase::Write()
   control_signal.AddJointPositionValues(hw_commands_.cbegin(), hw_commands_.cend());
   control_signal.AddGPIOValues(hw_gpio_commands_.cbegin(), hw_gpio_commands_.cend());
 
+  // measure elapsed time since last motion state message
+  // No need to check msg_received_ here, as Write() is only called when msg_received_ is true
+  auto now = std::chrono::steady_clock::now();
+  auto elapsed =
+    std::chrono::duration_cast<std::chrono::microseconds>(now - last_msg_received_time_);
+  // if the delay exceeds threshold, flag as warning
+  if (elapsed > KukaRSIHardwareInterfaceBase::kWarningThreshold)
+  {
+    RCLCPP_WARN(
+      logger_,
+      "Slow response: %ld us elapsed between motion state was received and control signal sent",
+      static_cast<uint64_t>(elapsed.count()));
+  }
+
   auto send_reply_status = robot_ptr_->SendControlSignal();
 
   if (send_reply_status.return_code != kuka::external::control::ReturnCode::OK)
@@ -527,13 +585,23 @@ void KukaRSIHardwareInterfaceBase::Write()
   }
 }
 
+void KukaRSIHardwareInterfaceBase::ResetDiagnostics()
+{
+  // Reset diagnostics related variables
+  packet_loss_count_ = 0;
+  last_ipoc_ = 0;
+  last_msg_received_time_ = std::chrono::steady_clock::time_point{};
+}
+
 kuka::external::control::Status KukaRSIHardwareInterfaceBase::ChangeCycleTime()
 {
   const RsiCycleTime cycle_time = static_cast<RsiCycleTime>(cycle_time_command_);
 
   if (prev_cycle_time_ != cycle_time)
   {
-    RCLCPP_INFO(logger_, "Changing RSI cycle time to %d", static_cast<int>(cycle_time));
+    RCLCPP_INFO(
+      logger_, "Changing RSI cycle time to %s",
+      kuka::external::control::kss::CycleTimeToString(cycle_time));
     auto status = robot_ptr_->SetCycleTime(cycle_time);
     if (status.return_code != kuka::external::control::ReturnCode::OK)
     {
@@ -552,6 +620,34 @@ void KukaRSIHardwareInterfaceBase::initialize_command_interfaces(
   prev_cycle_time_ = cycle_time;
   hw_control_mode_command_ = static_cast<double>(control_mode);
   cycle_time_command_ = static_cast<double>(cycle_time);
+}
+
+void KukaRSIHardwareInterfaceBase::ConfigureJoints(
+  kuka::external::control::kss::Configuration & config) const
+{
+  using JC = kuka::external::control::kss::JointConfiguration;
+
+  config.dof = info_.joints.size();
+  config.joint_configs.reserve(info_.joints.size());
+
+  for (const auto & joint : info_.joints)
+  {
+    // Default to revolute joints
+    const auto type_it = joint.parameters.find(std::string(kTypeParamValue));
+    const auto type =
+      (type_it == joint.parameters.end()) ? JC::Type::REVOLUTE : JC::ToType(type_it->second);
+
+    // Default to internal joints
+    const auto external_it = joint.parameters.find(std::string(kIsExternalParamValue));
+    const bool is_external =
+      (external_it == joint.parameters.end()) ? false : external_it->second == "true";
+
+    config.joint_configs.emplace_back(joint.name, type, is_external);
+
+    RCLCPP_INFO_STREAM(
+      logger_, "Configured joint \"" << joint.name << "\": type=" << JC::TypeToString(type)
+                                     << ", external=" << (is_external ? "true" : "false"));
+  }
 }
 
 }  // namespace kuka_rsi_driver
